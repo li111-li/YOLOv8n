@@ -1,0 +1,41 @@
+import os
+
+
+def rename_images_in_folders(base_folder):
+    if not os.path.exists(base_folder):
+        print(f"Base folder does not exist: {base_folder}")
+        return
+
+    # 遍历子文件夹
+    for folder_name in os.listdir(base_folder):
+        folder_path = os.path.join(base_folder, folder_name)
+        if os.path.isdir(folder_path):
+            print(f"Checking folder: {folder_name}")
+            images = sorted(os.listdir(folder_path))
+
+            if not images:
+                print(f"Folder {folder_name} is empty, skipping.")
+                continue
+
+            # 遍历文件
+            for index, image_name in enumerate(images, start=1):
+                old_image_path = os.path.join(folder_path, image_name)
+                file_extension = os.path.splitext(image_name)[1]
+
+                if not file_extension:
+                    print(f"Skipping {old_image_path}, no file extension.")
+                    continue
+
+                new_image_name = f"{folder_name}-{index}{file_extension}"
+                new_image_path = os.path.join(folder_path, new_image_name)
+
+                if os.path.exists(new_image_path):
+                    print(f"File {new_image_path} already exists, skipping.")
+                else:
+                    print(f"Renaming {old_image_path} to {new_image_path}")
+                    os.rename(old_image_path, new_image_path)
+
+
+# 使用示例
+base_folder = r"G:\数据"
+rename_images_in_folders(base_folder)
