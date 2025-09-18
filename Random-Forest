@@ -1,0 +1,434 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import LabelEncoder
+from skimage.feature import hog, local_binary_pattern
+from skimage.color import rgb2gray
+import joblib
+import time
+import csv
+from datetime import datetime
+
+
+class ImageRFClassifier:
+    def __init__(self, n_estimators=100, max_depth=None, random_state=42):
+        """
+        初始化随机森林图像分类器
+        :param n_estimators: 随机森林中决策树的数量（默认100）
+        :param max_depth: 每棵树的最大深度（None表示不限制，默认None）
+        :param random_state: 随机种子（保证结果可复现，默认42）
+        """
+        # 初始化随机森林模型（使用所有CPU核心加速）
+        self.model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+        # 标签编码器（将字符串类别转为数字）
+        self.label_encoder = LabelEncoder()
+        # 记录特征提取和训练耗时
+        self.feature_extraction_time = 0
+        self.training_time = 0
+        # 保存模型参数（用于后续加载恢复）
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.random_state = random_state
+        # 存储从数据中获取的「按数字排序的类别」
+        self.sorted_classes = None
+
+    def extract_features(self, image_path, use_hog=True, use_lbp=True, use_color_hist=True):
+        """
+        从单张图像中提取特征（HOG+LBP+颜色直方图）
+        """
+        # 读取图像并统一调整为128x128（减少计算量，保证输入尺寸一致）
+        img = Image.open(image_path).resize((128, 128))
+        img_array = np.array(img)
+        features = []
+
+        # 1. 提取HOG特征（需灰度图，捕捉纹理和形状）
+        if use_hog:
+            start = time.time()
+            # 彩色图转灰度图，灰度图直接使用
+            gray_img = rgb2gray(img_array) if len(img_array.shape) == 3 else img_array
+            # HOG参数：9个方向、8x8像素单元格、2x2单元格块、L2-Hys归一化
+            hog_feat = hog(
+                gray_img, orientations=9, pixels_per_cell=(8, 8),
+                cells_per_block=(2, 2), block_norm='L2-Hys'
+            )
+            features.extend(hog_feat)
+            self.feature_extraction_time += time.time() - start
+
+        # 2. 提取LBP特征（需灰度图，捕捉局部纹理）
+        if use_lbp:
+            start = time.time()
+            gray_img = rgb2gray(img_array) if len(img_array.shape) == 3 else img_array
+            # LBP参数：8个邻域点、半径1、统一模式（减少特征维度）
+            lbp = local_binary_pattern(gray_img, P=8, R=1, method='uniform')
+            # 计算LBP直方图（10个bin，对应0-9的统一模式）
+            lbp_hist, _ = np.histogram(lbp, bins=np.arange(0, 10), density=True)
+            features.extend(lbp_hist)
+            self.feature_extraction_time += time.time() - start
+
+        # 3. 提取颜色直方图特征（仅彩色图，捕捉颜色分布）
+        if use_color_hist and len(img_array.shape) == 3:
+            start = time.time()
+            # 对RGB三个通道分别计算直方图（每个通道32个bin，共96维）
+            for channel in range(3):
+                hist, _ = np.histogram(img_array[:, :, channel], bins=32, range=(0, 256), density=True)
+                features.extend(hist)
+            self.feature_extraction_time += time.time() - start
+
+        return np.array(features)
+
+    def _load_random_split(self, data_dir, max_samples_per_class=None, test_size=0.2):
+        """
+        私有方法：随机划分训练集/测试集
+        """
+        print("=" * 50)
+        print("正在使用【随机划分】模式加载数据...")
+        image_paths = []  # 存储所有图像路径
+        labels = []  # 存储对应图像的类别标签
+
+        # 从数据目录获取所有类别文件夹，按数字从小到大排序
+        all_label_folders = [f for f in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, f))]
+        self.sorted_classes = sorted(all_label_folders, key=lambda x: int(x))  # 按数字排序
+        print(f"检测到 {len(self.sorted_classes)} 个类别，按数字排序为：{self.sorted_classes}")
+
+        # 按排序后的类别遍历
+        for label in self.sorted_classes:
+            label_dir = os.path.join(data_dir, label)
+            if not os.path.isdir(label_dir):
+                print(f"警告：类别 '{label}' 的文件夹不存在，跳过该类别")
+                continue  # 跳过不存在的类别文件夹
+
+            # 获取当前类别下的所有图像文件
+            class_imgs = [
+                os.path.join(label_dir, img_file)
+                for img_file in os.listdir(label_dir)
+                if img_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))
+            ]
+
+            # 限制每个类别的最大样本数（平衡数据）
+            if max_samples_per_class and len(class_imgs) > max_samples_per_class:
+                class_imgs = class_imgs[:max_samples_per_class]
+
+            image_paths.extend(class_imgs)
+            labels.extend([label] * len(class_imgs))
+            print(f"类别 '{label}': 加载 {len(class_imgs)} 个样本")
+
+        # 提取所有图像的特征
+        print(f"\n开始提取 {len(image_paths)} 张图像的特征...")
+        self.feature_extraction_time = 0
+        X = [self.extract_features(img_path) for img_path in image_paths]
+        X = np.array(X)
+        y = np.array(labels)
+
+        # 按排序后的类别编码
+        self.label_encoder.fit(self.sorted_classes)
+        y_encoded = self.label_encoder.transform(y)
+
+        # 随机划分训练集/测试集
+        X_train, X_test, y_train, y_test, img_train, img_test = train_test_split(
+            X, y_encoded, image_paths, test_size=test_size,
+            random_state=self.random_state, stratify=y_encoded
+        )
+
+        # 打印数据加载结果
+        print(f"\n【随机划分】数据加载完成:")
+        print(f"特征提取总耗时: {self.feature_extraction_time:.2f} 秒")
+        print(f"训练集: {X_train.shape[0]} 个样本, 特征维度: {X_train.shape[1]}")
+        print(f"测试集: {X_test.shape[0]} 个样本, 特征维度: {X_test.shape[1]}")
+        print("=" * 50)
+
+        return X_train, X_test, y_train, y_test, img_test
+
+    def _load_manual_split(self, train_dir, test_dir, max_samples_per_class=None):
+        """
+        私有方法：手动划分训练集/测试集
+        """
+        print("=" * 50)
+        print("正在使用【手动划分】模式加载数据...")
+
+        # 辅助函数：按排序后的类别加载单个目录（训练集/测试集）
+        def load_single_dir(root_dir, split_type):
+            img_paths = []
+            labels = []
+            print(f"\n加载{split_type}集目录: {root_dir}")
+
+            # 训练集决定排序，测试集沿用训练集排序
+            if split_type == "训练":
+                all_label_folders = [f for f in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, f))]
+                self.sorted_classes = sorted(all_label_folders, key=lambda x: int(x))
+                print(f"训练集检测到 {len(self.sorted_classes)} 个类别，按数字排序为：{self.sorted_classes}")
+            else:
+                # 测试集缺失训练集类别时提示
+                missing_labels = [l for l in self.sorted_classes if not os.path.isdir(os.path.join(root_dir, l))]
+                if missing_labels:
+                    print(f"警告：测试集缺失训练集类别 {missing_labels}，评估时保留这些类别位置")
+
+            # 按训练集排序后的类别遍历
+            for label in self.sorted_classes:
+                label_dir = os.path.join(root_dir, label)
+                if not os.path.isdir(label_dir):
+                    print(f"警告：{split_type}集类别 '{label}' 的文件夹不存在，跳过该类别")
+                    continue
+
+                class_imgs = [
+                    os.path.join(label_dir, img_file)
+                    for img_file in os.listdir(label_dir)
+                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))
+                ]
+
+                if max_samples_per_class and len(class_imgs) > max_samples_per_class:
+                    class_imgs = class_imgs[:max_samples_per_class]
+
+                img_paths.extend(class_imgs)
+                labels.extend([label] * len(class_imgs))
+                print(f"  {split_type}集-类别 '{label}': {len(class_imgs)} 个样本")
+            return img_paths, labels
+
+        # 分别加载训练集和测试集
+        train_paths, train_labels = load_single_dir(train_dir, "训练")
+        test_paths, test_labels = load_single_dir(test_dir, "测试")
+
+        # 提取训练集特征
+        print(f"\n开始提取训练集 {len(train_paths)} 张图像的特征...")
+        self.feature_extraction_time = 0
+        X_train = [self.extract_features(path) for path in train_paths]
+        X_train = np.array(X_train)
+
+        # 提取测试集特征
+        print(f"\n开始提取测试集 {len(test_paths)} 张图像的特征...")
+        X_test = [self.extract_features(path) for path in test_paths]
+        X_test = np.array(X_test)
+
+        # 按排序后的类别编码
+        self.label_encoder.fit(self.sorted_classes)
+        y_train_encoded = self.label_encoder.transform(train_labels)  # 训练集编码
+        y_test_encoded = self.label_encoder.transform(test_labels)    # 测试集编码
+
+        # 打印数据加载结果
+        print(f"\n【手动划分】数据加载完成:")
+        print(f"特征提取总耗时: {self.feature_extraction_time:.2f} 秒")
+        print(f"训练集: {X_train.shape[0]} 个样本, 特征维度: {X_train.shape[1]}")
+        print(f"测试集: {X_test.shape[0]} 个样本, 特征维度: {X_test.shape[1]}")
+        print("=" * 50)
+
+        return X_train, X_test, y_train_encoded, y_test_encoded, test_paths
+
+    def load_data(self, split_type="random", **kwargs):
+        """
+        统一数据加载入口（支持两种划分方式）
+        """
+        if split_type == "random":
+            if "data_dir" not in kwargs or not os.path.exists(kwargs["data_dir"]):
+                raise ValueError("随机划分模式需传入有效参数: data_dir（全量数据目录）")
+            return self._load_random_split(
+                data_dir=kwargs["data_dir"],
+                max_samples_per_class=kwargs.get("max_samples_per_class"),
+                test_size=kwargs.get("test_size", 0.2)
+            )
+        elif split_type == "manual":
+            if ("train_dir" not in kwargs or not os.path.exists(kwargs["train_dir"])) or \
+                    ("test_dir" not in kwargs or not os.path.exists(kwargs["test_dir"])):
+                raise ValueError("手动划分模式需传入有效参数: train_dir和test_dir")
+            return self._load_manual_split(
+                train_dir=kwargs["train_dir"],
+                test_dir=kwargs["test_dir"],
+                max_samples_per_class=kwargs.get("max_samples_per_class")
+            )
+        else:
+            raise ValueError(f"划分方式 '{split_type}' 不支持，仅支持 'random' 或 'manual'")
+
+    def train(self, X_train, y_train):
+        """训练随机森林模型"""
+        print("\n" + "=" * 50)
+        print("开始训练随机森林模型...")
+        start = time.time()
+        self.model.fit(X_train, y_train)
+        self.training_time = time.time() - start
+        print(f"模型训练完成！训练耗时: {self.training_time:.2f} 秒")
+        print("=" * 50)
+
+    def evaluate(self, X_test, y_test, img_test, output_dir="data_save"):
+        """评估模型性能并保存结果"""
+        os.makedirs(output_dir, exist_ok=True)
+        print("\n" + "=" * 50)
+        print(f"开始评估模型，结果将保存到: {output_dir}")
+
+        # 模型预测
+        y_pred = self.model.predict(X_test)
+
+        # 1. 核心评估指标
+        accuracy = accuracy_score(y_test, y_pred)
+        cv_scores = cross_val_score(self.model, X_test, y_test, cv=5, scoring="accuracy")
+
+        print(f"\n【核心评估结果】")
+        print(f"测试集准确率: {accuracy:.4f}")
+        print(f"5折交叉验证准确率: {cv_scores.mean():.4f} (±{cv_scores.std() * 2:.4f})")
+
+        # 2. 分类报告：按排序后的类别输出
+        print(f"\n【分类详细报告】")
+        report = classification_report(
+            y_test, y_pred,
+            target_names=self.sorted_classes,  # 用自动排序的类别
+            zero_division=0
+        )
+        print(report)
+        report_path = os.path.join(output_dir, "classification_report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(f"模型评估报告（生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）\n")
+            f.write(f"测试集准确率: {accuracy:.4f}\n")
+            f.write(f"5折交叉验证准确率: {cv_scores.mean():.4f} (±{cv_scores.std() * 2:.4f})\n\n")
+            f.write(report)
+
+        # 3. 混淆矩阵：按排序后的类别排列
+        cm = confusion_matrix(
+            y_test, y_pred,
+            labels=self.label_encoder.transform(self.sorted_classes)  # 按排序类别定矩阵顺序
+        )
+        # 绘制混淆矩阵（标签用排序后的类别）
+        plt.figure(figsize=(12, 10))
+        disp = ConfusionMatrixDisplay(
+            confusion_matrix=cm,
+            display_labels=self.sorted_classes  # 坐标轴标签按数字排序
+        )
+        disp.plot(cmap="Blues", values_format="d")
+        plt.title(f"混淆矩阵（按类别数字从小到大排序）", fontsize=14)
+        plt.xticks(rotation=0)  # 数字标签无需旋转
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        cm_path = os.path.join(output_dir, "confusion_matrix.png")
+        plt.savefig(cm_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"\n混淆矩阵已保存到: {cm_path}（行/列均按类别数字从小到大排序）")
+
+        # 4. 保存详细预测结果（CSV文件）
+        self.save_prediction_results(y_test, y_pred, img_test, output_dir)
+
+        return accuracy
+
+    def save_prediction_results(self, y_true, y_pred, img_paths, output_dir):
+        """保存详细的预测结果到CSV文件"""
+        true_labels = self.label_encoder.inverse_transform(y_true)
+        pred_labels = self.label_encoder.inverse_transform(y_pred)
+
+        results = [
+            {
+                "image_id": i + 1,
+                "image_path": path,
+                "true_label": true,
+                "predicted_label": pred,
+                "correct": true == pred
+            }
+            for i, (true, pred, path) in enumerate(zip(true_labels, pred_labels, img_paths))
+        ]
+
+        # 保存CSV
+        csv_path = os.path.join(output_dir, "prediction_results.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+            writer.writeheader()
+            writer.writerows(results)
+
+        # 保存统计信息（按排序类别）
+        correct = sum(1 for r in results if r["correct"])
+        stats_path = os.path.join(output_dir, "prediction_stats.txt")
+        with open(stats_path, "w", encoding="utf-8") as f:
+            f.write(f"预测结果统计（生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"总测试样本数: {len(results)}\n")
+            f.write(f"正确预测数: {correct}\n")
+            f.write(f"测试准确率: {correct / len(results):.4f}\n\n")
+            f.write("按类别统计（从小到大顺序）:\n")
+            for label in self.sorted_classes:  # 按排序后的类别统计
+                total = sum(1 for r in results if r["true_label"] == label)
+                label_correct = sum(1 for r in results if r["true_label"] == label and r["correct"])
+                acc = label_correct / total if total > 0 else 0
+                f.write(f"{label}: 正确{label_correct}/{total}样本, 准确率{acc:.4f}\n")
+
+        print(f"预测结果详情已保存到: {csv_path}")
+        print(f"预测统计信息已保存到: {stats_path}")
+        print("=" * 50)
+
+    def predict_single_image(self, image_path):
+        """预测单张图像的类别"""
+        features = self.extract_features(image_path)
+        pred_encoded = self.model.predict([features])
+        return self.label_encoder.inverse_transform(pred_encoded)[0]
+
+    def save_model(self, model_path):
+        """保存模型到文件"""
+        joblib.dump({
+            "model": self.model,
+            "label_encoder": self.label_encoder,
+            "params": {"n_estimators": self.n_estimators, "max_depth": self.max_depth},
+            "sorted_classes": self.sorted_classes  # 保存类别排序信息
+        }, model_path)
+        print(f"模型已保存到: {model_path}")
+
+    def load_model(self, model_path):
+        """从文件加载模型"""
+        data = joblib.load(model_path)
+        self.model = data["model"]
+        self.label_encoder = data["label_encoder"]
+        self.n_estimators = data["params"]["n_estimators"]
+        self.max_depth = data["params"]["max_depth"]
+        self.sorted_classes = data["sorted_classes"]  # 恢复类别排序
+        print(f"已从 {model_path} 加载模型")
+
+
+# -------------------------- 主程序入口 --------------------------
+if __name__ == "__main__":
+    # 1. 初始化分类器
+    rf_classifier = ImageRFClassifier(
+        n_estimators=200,  # 树的数量
+        max_depth=None,    # 树深度（None表示不限制）
+        random_state=42    # 固定随机种子，保证结果可复现
+    )
+
+    # 2. 配置路径（请根据你的实际数据路径修改）
+    output_dir = r"E:\数据\张雅霖\数据3\结果"  # 结果输出目录（自动创建）
+    use_random_split = False  # 切换为True使用随机划分，False使用手动划分
+
+    # -------------------------- 方式1：使用随机划分 --------------------------
+    if use_random_split:
+        data_dir = r"E:\数据\张雅霖"  # 全量数据目录（包含所有类别子文件夹）
+        X_train, X_test, y_train, y_test, img_test = rf_classifier.load_data(
+            split_type="random",
+            data_dir=data_dir,
+            max_samples_per_class=500,  # 每个类别的最大样本数（防止内存不足）
+            test_size=0.3  # 测试集占比30%
+        )
+    # -------------------------- 方式2：使用手动划分 --------------------------
+    else:
+        train_dir = r"E:\数据\张雅霖\数据3\train"  # 训练集目录（包含类别子文件夹）
+        test_dir = r"E:\数据\张雅霖\数据3\val"    # 测试集目录（包含类别子文件夹）
+        X_train, X_test, y_train, y_test, img_test = rf_classifier.load_data(
+            split_type="manual",
+            train_dir=train_dir,
+            test_dir=test_dir,
+            max_samples_per_class=500  # 每个类别的最大样本数
+        )
+
+    # 3. 训练模型
+    rf_classifier.train(X_train, y_train)
+
+    # 4. 评估模型（结果保存到output_dir）
+    accuracy = rf_classifier.evaluate(X_test, y_test, img_test, output_dir)
+
+    # 5. 保存模型
+    model_save_path = os.path.join(output_dir, "image_rf_model.pkl")
+    rf_classifier.save_model(model_save_path)
+
+    # 6. 示例：预测单张图像（可选，取消注释即可使用）
+    # if os.path.exists(model_save_path):
+    #     rf_classifier.load_model(model_save_path)
+    #     test_image_path = r"E:\数据\张雅霖\test\0\test_image.png"  # 替换为实际图像路径
+    #     if os.path.exists(test_image_path):
+    #         prediction = rf_classifier.predict_single_image(test_image_path)
+    #         print(f"\n单张图像预测结果: {prediction}")
