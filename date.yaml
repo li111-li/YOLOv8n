@@ -1,8 +1,8 @@
-path: dataset/images
+path: datasets/images
 
-train: dataset/images/train
-val: dataset/images/val
-  # 修改为图像路径
+train: datasets/images/train
+val: datasets/images/val
+  
 
 # Classes
 names:
@@ -27,4 +27,5 @@ names:
   18: C260
   19: C280
   20: C300
+
 
