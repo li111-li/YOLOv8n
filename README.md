@@ -33,7 +33,7 @@ datasets/
 │ │ ├── img_0-1.jpg
 │ │ ├── img_0-2.jpg
 │ │ └── ...
-│ ├── val/
+│ └── val/
 │   ├── img_0-1.jpg
 │   ├── img_0-2.jpg
 │   └── ...
