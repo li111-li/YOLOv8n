@@ -19,9 +19,9 @@ Adjust paths in data.yaml if necessary.
 ## Training
 To start training the YOLOv8n model, open a terminal and run the following command:<br> 
 ```
-yolo train data=datasets\HSA.yaml model=yolov8n.pt epochs=150 lr0=0.001 batch=4
+yolo train data=datasets\data.yaml model=yolov8n.pt epochs=150 lr0=0.001 batch=4
 ```
-`data=datasets\HSA.yaml`：The training command specifies the dataset yaml file <br> 
+`data=datasets\data.yaml`：The training command specifies the dataset yaml file <br> 
 
 `model=yolov8n.pt`: the pre-trained YOLOv8n weights 
 
