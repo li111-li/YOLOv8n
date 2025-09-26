@@ -1,0 +1,30 @@
+path: dataset/images
+
+train: dataset/images/train
+val: dataset/images/val
+  # 修改为图像路径
+
+# Classes
+names:
+  0: C0
+  1: C10
+  2: C20
+  3: C30
+  4: C40
+  5: C50
+  6: C60
+  7: C70
+  8: C80
+  9: C90
+  10: C100
+  11: C120
+  12: C140
+  13: C160
+  14: C180
+  15: C200
+  16: C220
+  17: C240
+  18: C260
+  19: C280
+  20: C300
+
